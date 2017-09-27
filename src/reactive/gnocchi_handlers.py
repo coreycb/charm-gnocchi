@@ -48,7 +48,7 @@ def render_config(*args):
     with charm.provide_charm_instance() as charm_class:
         charm_class.enable_services()
         charm_class.render_with_interfaces(args)
-        charm_class.enable_apache2_site()
+        charm_class.enable_webserver_site()
         charm_class.assess_status()
     reactive.set_state('config.rendered')
 

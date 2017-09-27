@@ -27,14 +27,27 @@ import charms_openstack.ip as os_ip
 
 GNOCCHI_DIR = '/etc/gnocchi'
 GNOCCHI_CONF = os.path.join(GNOCCHI_DIR, 'gnocchi.conf')
-GNOCCHI_APACHE_SITE = 'gnocchi-api'
+GNOCCHI_WEBSERVER_SITE = 'gnocchi-api'
 GNOCCHI_WSGI_CONF = '/etc/apache2/sites-available/{}.conf'.format(
-    GNOCCHI_APACHE_SITE)
+    GNOCCHI_WEBSERVER_SITE)
+
+GNOCCHI_DIR_SNAP = '/var/snap/gnocchi/common/etc/gnocchi'
+GNOCCHI_CONF_SNAP = os.path.join(GNOCCHI_DIR_SNAP, 'gnocchi.conf')
+GNOCCHI_WEBSERVER_SITE_SNAP = 'gnocchi-nginx'
+GNOCCHI_WSGI_CONF_SNAP = '/var/snap/gnocchi/common/etc/nginx/sites-enabled/{}.conf'.format(
+    GNOCCHI_WEBSERVER_SITE_SNAP)
+GNOCCHI_NGINX_CONF_SNAP = '/var/snap/gnocchi/common/etc/nginx/nginx.conf'
 
 CEPH_CONF = '/etc/ceph/ceph.conf'
 
 DB_INTERFACE = 'shared-db'
 
+@charms_openstack.adapters.config_property
+def log_config(config):
+    if ch_utils.snap_install_requested():
+        return '/var/snap/gnocchi/common/log/gnocchi-api.log'
+    else:
+        return '/var/log/gnocchi/gnocchi-api.log'
 
 # TODO(jamespage): charms.openstack
 class StorageCephRelationAdapter(adapters.OpenStackRelationAdapter):
@@ -99,12 +112,18 @@ class GnocchiCharm(charms_openstack.charm.HAOpenStackCharm):
     service_name = name = 'gnocchi'
 
     # First release supported
-    release = 'mitaka'
+    # NOTE(coreycb): create ocata class. snap is only supported from ocata up.
+    #release = 'mitaka'
+    release = 'ocata'
 
     # List of packages to install for this charm
     packages = ['gnocchi-api', 'gnocchi-metricd', 'python-apt',
                 'ceph-common', 'python-rados', 'python-keystonemiddleware',
                 'apache2', 'libapache2-mod-wsgi']
+
+    snaps = ['gnocchi']
+    # TODO (coreycb): Drop snap_packages and add ceph-common and python-rados to gnocchi snap
+    snap_packages = ['ceph-common', 'python-rados']
 
     api_ports = {
         'gnocchi-api': {
@@ -119,6 +138,7 @@ class GnocchiCharm(charms_openstack.charm.HAOpenStackCharm):
     service_type = 'gnocchi'
 
     services = ['gnocchi-metricd', 'apache2']
+    snap_services = ['snap.gnocchi.metricd', 'snap.gnocchi.nginx', 'snap.gnocchi.uwsgi']
 
     required_relations = ['shared-db', 'identity-service',
                           'storage-ceph', 'coordinator-memcached']
@@ -128,10 +148,17 @@ class GnocchiCharm(charms_openstack.charm.HAOpenStackCharm):
         GNOCCHI_WSGI_CONF: ['apache2'],
         CEPH_CONF: services,
     }
+    snap_restart_map = {
+        GNOCCHI_CONF_SNAP: snap_services,
+        GNOCCHI_WSGI_CONF_SNAP: ['snap.gnocchi.nginx', 'snap.gnocchi.uwsgi'],
+        GNOCCHI_NGINX_CONF_SNAP: ['snap.gnocchi.nginx', 'snap.gnocchi.uwsgi'],
+        CEPH_CONF: snap_services,
+    }
 
     ha_resources = ['vips', 'haproxy']
 
     release_pkg = 'gnocchi-common'
+    release_snap = 'gnocchi'
 
     package_codenames = {
         'gnocchi-common': collections.OrderedDict([
@@ -143,6 +170,8 @@ class GnocchiCharm(charms_openstack.charm.HAOpenStackCharm):
 
     sync_cmd = ['gnocchi-upgrade',
                 '--log-file=/var/log/gnocchi/gnocchi-upgrade.log']
+    snap_sync_cmd = ['snap.gnocchi-upgrade',
+                     '--log-file=/var/snap/gnocchi/common/log/gnocchi/gnocchi-upgrade.log']
 
     adapters_class = GnocchiCharmRelationAdapaters
 
@@ -152,26 +181,37 @@ class GnocchiCharm(charms_openstack.charm.HAOpenStackCharm):
         ch_utils.os_release() function.
         """
         if release is None:
-            release = ch_utils.os_release('python-keystonemiddleware')
+            if ch_utils.snap_install_requested():
+                release = ch_utils.os_release('gnocchi')
+            else:
+                release = ch_utils.os_release('gnocchi-common')
         super(GnocchiCharm, self).__init__(release=release, **kwargs)
 
     def install(self):
         super(GnocchiCharm, self).install()
-        # NOTE(jamespage): always pause gnocchi-api service as we force
-        #                  execution with Apache2+mod_wsgi
-        host.service_pause('gnocchi-api')
+        if ch_utils.snap_install_requested():
+            host.service_pause('snap.gnocchi.nginx')
+            host.service_pause('snap.gnocchi.uwsgi')
+        else:
+            # NOTE(jamespage): always pause gnocchi-api service as we force
+            #                  execution with Apache2+mod_wsgi
+            host.service_pause('gnocchi-api')
 
-    def enable_apache2_site(self):
-        """Enable Gnocchi API apache2 site if rendered or installed"""
-        if os.path.exists(GNOCCHI_WSGI_CONF):
-            check_enabled = subprocess.call(
-                ['a2query', '-s', GNOCCHI_APACHE_SITE]
-            )
-            if check_enabled != 0:
-                subprocess.check_call(['a2ensite',
-                                       GNOCCHI_APACHE_SITE])
-                host.service_reload('apache2',
-                                    restart_on_failure=True)
+    def enable_webserver_site(self):
+        """Enable Gnocchi API apache2 or nginx site if rendered or installed"""
+        if ch_utils.snap_install_requested():
+            # TODO(coreycb): i don't think we need to do anything to enable nginx site
+            pass
+        else:
+            if os.path.exists(GNOCCHI_WSGI_CONF):
+                check_enabled = subprocess.call(
+                    ['a2query', '-s', GNOCCHI_WEBSERVER_SITE]
+                )
+                if check_enabled != 0:
+                    subprocess.check_call(['a2ensite',
+                                           GNOCCHI_WEBSERVER_SITE])
+                    host.service_reload('apache2',
+                                        restart_on_failure=True)
 
     def get_database_setup(self):
         return [{
@@ -181,10 +221,18 @@ class GnocchiCharm(charms_openstack.charm.HAOpenStackCharm):
 
     def disable_services(self):
         '''Disable all services related to gnocchi'''
-        for svc in self.services:
-            host.service_pause(svc)
+        if ch_utils.snap_install_requested():
+            for svc in self.snap_services:
+                host.service_pause(svc)
+        else:
+            for svc in self.services:
+                host.service_pause(svc)
 
     def enable_services(self):
         '''Enable all services related to gnocchi'''
-        for svc in self.services:
-            host.service_resume(svc)
+        if ch_utils.snap_install_requested():
+            for svc in self.snap_services:
+                host.service_resume(svc)
+        else:
+            for svc in self.services:
+                host.service_resume(svc)
